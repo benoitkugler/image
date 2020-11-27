@@ -609,6 +609,7 @@ type Font struct {
 		capHeight        int32
 		glyphData        glyphData
 		glyphIndex       glyphIndexFunc
+		chars            charsFunc
 		bounds           [4]int16
 		descent          int32
 		indexToLocFormat bool // false means short, true means long.
@@ -661,7 +662,7 @@ func (f *Font) initialize(offset int, isDfont bool) error {
 	if err != nil {
 		return err
 	}
-	buf, glyphIndex, err := f.parseCmap(buf)
+	buf, glyphIndex, chars, err := f.parseCmap(buf)
 	if err != nil {
 		return err
 	}
@@ -694,6 +695,7 @@ func (f *Font) initialize(offset int, isDfont bool) error {
 	f.cached.capHeight = capHeight
 	f.cached.glyphData = glyphData
 	f.cached.glyphIndex = glyphIndex
+	f.cached.chars = chars
 	f.cached.bounds = bounds
 	f.cached.descent = descent
 	f.cached.indexToLocFormat = indexToLocFormat
@@ -819,20 +821,20 @@ func (f *Font) initializeTables(offset int, isDfont bool) (buf1 []byte, isPostSc
 	return buf, isPostScript, nil
 }
 
-func (f *Font) parseCmap(buf []byte) (buf1 []byte, glyphIndex glyphIndexFunc, err error) {
+func (f *Font) parseCmap(buf []byte) (buf1 []byte, glyphIndex glyphIndexFunc, chars charsFunc, err error) {
 	// https://www.microsoft.com/typography/OTSPEC/cmap.htm
 
 	const headerSize, entrySize = 4, 8
 	if f.cmap.length < headerSize {
-		return nil, nil, errInvalidCmapTable
+		return nil, nil, nil, errInvalidCmapTable
 	}
 	u, err := f.src.u16(buf, f.cmap, 2)
 	if err != nil {
-		return nil, nil, err
+		return nil, nil, nil, err
 	}
 	numSubtables := int(u)
 	if f.cmap.length < headerSize+entrySize*uint32(numSubtables) {
-		return nil, nil, errInvalidCmapTable
+		return nil, nil, nil, errInvalidCmapTable
 	}
 
 	var (
@@ -847,7 +849,7 @@ func (f *Font) parseCmap(buf []byte) (buf1 []byte, glyphIndex glyphIndexFunc, er
 	for i := 0; i < numSubtables; i++ {
 		buf, err = f.src.view(buf, int(f.cmap.offset)+headerSize+entrySize*i, entrySize)
 		if err != nil {
-			return nil, nil, err
+			return nil, nil, nil, err
 		}
 		pid := u16(buf)
 		psid := u16(buf[2:])
@@ -858,11 +860,11 @@ func (f *Font) parseCmap(buf []byte) (buf1 []byte, glyphIndex glyphIndexFunc, er
 		offset := u32(buf[4:])
 
 		if offset > f.cmap.length-4 {
-			return nil, nil, errInvalidCmapTable
+			return nil, nil, nil, errInvalidCmapTable
 		}
 		buf, err = f.src.view(buf, int(f.cmap.offset+offset), 4)
 		if err != nil {
-			return nil, nil, err
+			return nil, nil, nil, err
 		}
 		format := u16(buf)
 		if !supportedCmapFormat(format, pid, psid) {
@@ -877,7 +879,7 @@ func (f *Font) parseCmap(buf []byte) (buf1 []byte, glyphIndex glyphIndexFunc, er
 	}
 
 	if bestWidth == 0 {
-		return nil, nil, errUnsupportedCmapEncodings
+		return nil, nil, nil, errUnsupportedCmapEncodings
 	}
 	return f.makeCachedGlyphIndex(buf, bestOffset, bestLength, bestFormat)
 }
@@ -1318,6 +1320,15 @@ func (f *Font) Bounds(b *Buffer, ppem fixed.Int26_6, h font.Hinting) (fixed.Rect
 // TODO: API for looking up glyph variants?? For example, some fonts may
 // provide both slashed and dotted zero glyphs ('0'), or regular and 'old
 // style' numerals, and users can direct software to choose a variant.
+
+// charsFunc resolve all the rune encoded by a font.
+// it can be seen as global version of the GlyphIndex method.
+type charsFunc func() (map[rune]GlyphIndex, error)
+
+// Chars returns the full range of encoded rune.
+func (f *Font) Chars() (map[rune]GlyphIndex, error) {
+	return f.cached.chars()
+}
 
 type glyphIndexFunc func(f *Font, b *Buffer, r rune) (GlyphIndex, error)
 

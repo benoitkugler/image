@@ -88,7 +88,7 @@ var supportedCmapFormat = func(format, pid, psid uint16) bool {
 	return false
 }
 
-func (f *Font) makeCachedGlyphIndex(buf []byte, offset, length uint32, format uint16) ([]byte, glyphIndexFunc, error) {
+func (f *Font) makeCachedGlyphIndex(buf []byte, offset, length uint32, format uint16) ([]byte, glyphIndexFunc, charsFunc, error) {
 	switch format {
 	case 0:
 		return f.makeCachedGlyphIndexFormat0(buf, offset, length)
@@ -102,17 +102,29 @@ func (f *Font) makeCachedGlyphIndex(buf []byte, offset, length uint32, format ui
 	panic("unreachable")
 }
 
-func (f *Font) makeCachedGlyphIndexFormat0(buf []byte, offset, length uint32) ([]byte, glyphIndexFunc, error) {
+func (f *Font) makeCachedGlyphIndexFormat0(buf []byte, offset, length uint32) ([]byte, glyphIndexFunc, charsFunc, error) {
 	if length != 6+256 || offset+length > f.cmap.length {
-		return nil, nil, errInvalidCmapTable
+		return nil, nil, nil, errInvalidCmapTable
 	}
 	var err error
 	buf, err = f.src.view(buf, int(f.cmap.offset+offset), int(length))
 	if err != nil {
-		return nil, nil, err
+		return nil, nil, nil, err
 	}
 	var table [256]byte
 	copy(table[:], buf[6:])
+
+	cf := func() (map[rune]GlyphIndex, error) {
+		chars := map[rune]GlyphIndex{}
+		for x, index := range table {
+			r := charmap.Macintosh.DecodeByte(byte(x))
+			if r != 0 {
+				chars[r] = GlyphIndex(index)
+			}
+		}
+		return chars, nil
+	}
+
 	return buf, func(f *Font, b *Buffer, r rune) (GlyphIndex, error) {
 		x, ok := charmap.Macintosh.EncodeRune(r)
 		if !ok {
@@ -120,39 +132,54 @@ func (f *Font) makeCachedGlyphIndexFormat0(buf []byte, offset, length uint32) ([
 			return 0, nil
 		}
 		return GlyphIndex(table[x]), nil
-	}, nil
+	}, cf, nil
 }
 
-func (f *Font) makeCachedGlyphIndexFormat4(buf []byte, offset, length uint32) ([]byte, glyphIndexFunc, error) {
+func (f *Font) makeCachedGlyphIndexFormat4(buf []byte, offset, length uint32) ([]byte, glyphIndexFunc, charsFunc, error) {
 	const headerSize = 14
 	if offset+headerSize > f.cmap.length {
-		return nil, nil, errInvalidCmapTable
+		return nil, nil, nil, errInvalidCmapTable
 	}
 	var err error
 	buf, err = f.src.view(buf, int(f.cmap.offset+offset), headerSize)
 	if err != nil {
-		return nil, nil, err
+		return nil, nil, nil, err
 	}
 	offset += headerSize
 
 	segCount := u16(buf[6:])
 	if segCount&1 != 0 {
-		return nil, nil, errInvalidCmapTable
+		return nil, nil, nil, errInvalidCmapTable
 	}
 	segCount /= 2
 	if segCount > maxCmapSegments {
-		return nil, nil, errUnsupportedNumberOfCmapSegments
+		return nil, nil, nil, errUnsupportedNumberOfCmapSegments
 	}
 
 	eLength := 8*uint32(segCount) + 2
 	if offset+eLength > f.cmap.length {
-		return nil, nil, errInvalidCmapTable
+		return nil, nil, nil, errInvalidCmapTable
 	}
 	buf, err = f.src.view(buf, int(f.cmap.offset+offset), int(eLength))
 	if err != nil {
-		return nil, nil, err
+		return nil, nil, nil, err
 	}
 	offset += eLength
+
+	indexesBase := f.cmap.offset + offset
+	indexesLength := f.cmap.length - offset
+
+	indexWithOffset := func(b *Buffer, entry *cmapEntry16, h int, c uint16) (GlyphIndex, error) {
+		offset := uint32(entry.offset) + 2*uint32(h-int(segCount)+int(c-entry.start))
+		if offset > indexesLength || offset+2 > indexesLength {
+			return 0, errInvalidCmapTable
+		}
+		x, err := b.view(&f.src, int(indexesBase+offset), 2)
+		if err != nil {
+			return 0, err
+		}
+		return GlyphIndex(u16(x)), nil
+	}
 
 	entries := make([]cmapEntry16, segCount)
 	for i := range entries {
@@ -163,8 +190,33 @@ func (f *Font) makeCachedGlyphIndexFormat4(buf []byte, offset, length uint32) ([
 			offset: u16(buf[6*len(entries)+2+2*i:]),
 		}
 	}
-	indexesBase := f.cmap.offset + offset
-	indexesLength := f.cmap.length - offset
+
+	cf := func() (map[rune]GlyphIndex, error) {
+		chars := map[rune]GlyphIndex{}
+		buffer := &Buffer{}
+		for i, cm := range entries {
+			if cm.offset == 0 {
+				for c := cm.start; c <= cm.end; c++ {
+					chars[rune(c)] = GlyphIndex(c + cm.delta)
+					if c == 65535 { // avoid overflow
+						break
+					}
+				}
+			} else {
+				for c := cm.start; c <= cm.end; c++ {
+					index, err := indexWithOffset(buffer, &cm, i, c)
+					if err != nil {
+						return nil, err
+					}
+					chars[rune(c)] = index
+					if c == 65535 { // avoid overflow
+						break
+					}
+				}
+			}
+		}
+		return chars, nil
+	}
 
 	return buf, func(f *Font, b *Buffer, r rune) (GlyphIndex, error) {
 		if uint32(r) > 0xffff {
@@ -182,30 +234,22 @@ func (f *Font) makeCachedGlyphIndexFormat4(buf []byte, offset, length uint32) ([
 			} else if entry.offset == 0 {
 				return GlyphIndex(c + entry.delta), nil
 			} else {
-				offset := uint32(entry.offset) + 2*uint32(h-len(entries)+int(c-entry.start))
-				if offset > indexesLength || offset+2 > indexesLength {
-					return 0, errInvalidCmapTable
-				}
-				x, err := b.view(&f.src, int(indexesBase+offset), 2)
-				if err != nil {
-					return 0, err
-				}
-				return GlyphIndex(u16(x)), nil
+				return indexWithOffset(b, entry, h, c)
 			}
 		}
 		return 0, nil
-	}, nil
+	}, cf, nil
 }
 
-func (f *Font) makeCachedGlyphIndexFormat6(buf []byte, offset, length uint32) ([]byte, glyphIndexFunc, error) {
+func (f *Font) makeCachedGlyphIndexFormat6(buf []byte, offset, length uint32) ([]byte, glyphIndexFunc, charsFunc, error) {
 	const headerSize = 10
 	if offset+headerSize > f.cmap.length {
-		return nil, nil, errInvalidCmapTable
+		return nil, nil, nil, errInvalidCmapTable
 	}
 	var err error
 	buf, err = f.src.view(buf, int(f.cmap.offset+offset), headerSize)
 	if err != nil {
-		return nil, nil, err
+		return nil, nil, nil, err
 	}
 	offset += headerSize
 
@@ -214,13 +258,13 @@ func (f *Font) makeCachedGlyphIndexFormat6(buf []byte, offset, length uint32) ([
 
 	eLength := 2 * uint32(entryCount)
 	if offset+eLength > f.cmap.length {
-		return nil, nil, errInvalidCmapTable
+		return nil, nil, nil, errInvalidCmapTable
 	}
 
 	if entryCount != 0 {
 		buf, err = f.src.view(buf, int(f.cmap.offset+offset), int(eLength))
 		if err != nil {
-			return nil, nil, err
+			return nil, nil, nil, err
 		}
 		offset += eLength
 	}
@@ -230,7 +274,15 @@ func (f *Font) makeCachedGlyphIndexFormat6(buf []byte, offset, length uint32) ([
 		entries[i] = u16(buf[2*i:])
 	}
 
-	return buf, func(f *Font, b *Buffer, r rune) (GlyphIndex, error) {
+	cf := func() (map[rune]GlyphIndex, error) {
+		chars := map[rune]GlyphIndex{}
+		for i := range entries {
+			chars[rune(i)+rune(firstCode)] = GlyphIndex(entries[i])
+		}
+		return chars, nil
+	}
+
+	return buf, func(f *Font, _ *Buffer, r rune) (GlyphIndex, error) {
 		if uint16(r) < firstCode {
 			return 0, nil
 		}
@@ -240,37 +292,37 @@ func (f *Font) makeCachedGlyphIndexFormat6(buf []byte, offset, length uint32) ([
 			return 0, nil
 		}
 		return GlyphIndex(entries[c]), nil
-	}, nil
+	}, cf, nil
 }
 
-func (f *Font) makeCachedGlyphIndexFormat12(buf []byte, offset, _ uint32) ([]byte, glyphIndexFunc, error) {
+func (f *Font) makeCachedGlyphIndexFormat12(buf []byte, offset, _ uint32) ([]byte, glyphIndexFunc, charsFunc, error) {
 	const headerSize = 16
 	if offset+headerSize > f.cmap.length {
-		return nil, nil, errInvalidCmapTable
+		return nil, nil, nil, errInvalidCmapTable
 	}
 	var err error
 	buf, err = f.src.view(buf, int(f.cmap.offset+offset), headerSize)
 	if err != nil {
-		return nil, nil, err
+		return nil, nil, nil, err
 	}
 	length := u32(buf[4:])
 	if f.cmap.length < offset || length > f.cmap.length-offset {
-		return nil, nil, errInvalidCmapTable
+		return nil, nil, nil, errInvalidCmapTable
 	}
 	offset += headerSize
 
 	numGroups := u32(buf[12:])
 	if numGroups > maxCmapSegments {
-		return nil, nil, errUnsupportedNumberOfCmapSegments
+		return nil, nil, nil, errUnsupportedNumberOfCmapSegments
 	}
 
 	eLength := 12 * numGroups
 	if headerSize+eLength != length {
-		return nil, nil, errInvalidCmapTable
+		return nil, nil, nil, errInvalidCmapTable
 	}
 	buf, err = f.src.view(buf, int(f.cmap.offset+offset), int(eLength))
 	if err != nil {
-		return nil, nil, err
+		return nil, nil, nil, err
 	}
 	offset += eLength
 
@@ -283,7 +335,17 @@ func (f *Font) makeCachedGlyphIndexFormat12(buf []byte, offset, _ uint32) ([]byt
 		}
 	}
 
-	return buf, func(f *Font, b *Buffer, r rune) (GlyphIndex, error) {
+	cf := func() (map[rune]GlyphIndex, error) {
+		chars := map[rune]GlyphIndex{}
+		for _, cm := range entries {
+			for c := cm.start; c <= cm.end; c++ {
+				chars[rune(c)] = GlyphIndex(c - cm.start + cm.delta)
+			}
+		}
+		return chars, nil
+	}
+
+	return buf, func(f *Font, _ *Buffer, r rune) (GlyphIndex, error) {
 		c := uint32(r)
 		for i, j := 0, len(entries); i < j; {
 			h := i + (j-i)/2
@@ -297,7 +359,7 @@ func (f *Font) makeCachedGlyphIndexFormat12(buf []byte, offset, _ uint32) ([]byt
 			}
 		}
 		return 0, nil
-	}, nil
+	}, cf, nil
 }
 
 type cmapEntry16 struct {
